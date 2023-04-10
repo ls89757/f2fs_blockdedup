@@ -46,8 +46,79 @@ struct Blkrefitem {
 	size_t ref;
 };
 
+// 根据加密page的指纹获取lblk_num
+struct Fingercryptitem {
+	char fingerprint_crypt[16];
+	u64 lblk_num;
+};
+
 struct Fingeritem *hashArray[DEDUP_TABLE_SIZE];
 struct Blkrefitem *blkArray[DEDUP_TABLE_SIZE];
+struct Fingercryptitem *hashcryptArray[DEDUP_TABLE_SIZE];
+
+void read_finger_blk_table_from_file(void) {
+	struct file *finger_table = NULL;
+	struct file *finger_crypt_table = NULL;
+	struct file *block_table = NULL;
+	loff_t pos_f, pos_b, pos_c;
+	int hashIndex = 0;
+
+	finger_table = filp_open("/fingertable", O_RDWR | O_CREAT, 0);
+	finger_crypt_table = filp_open("/fingercrypttable", O_RDWR | O_CREAT, 0);
+	block_table = filp_open("/blocktable", O_RDWR | O_CREAT, 0);
+	// 给HashArray的每个元素分配空间
+	for (hashIndex = 0; hashIndex < DEDUP_TABLE_SIZE; hashIndex++) {
+		if (hashArray[hashIndex] == NULL) {
+			hashArray[hashIndex] = (struct Fingeritem *)kmalloc(sizeof(struct Fingeritem), GFP_KERNEL);
+			hashArray[hashIndex]->blk_addr = 0;
+		}
+		if (hashcryptArray[hashIndex] == NULL) {
+			hashcryptArray[hashIndex] = (struct Fingercryptitem *)kmalloc(sizeof(struct Fingercryptitem), GFP_KERNEL);
+			hashcryptArray[hashIndex]->lblk_num = -1;
+		}
+		if (blkArray[hashIndex] == NULL) {
+			blkArray[hashIndex] = (struct Blkrefitem *)kmalloc(sizeof(struct Blkrefitem), GFP_KERNEL);
+			blkArray[hashIndex]->blk_addr = 0;
+			blkArray[hashIndex]->ref = 0;
+		}
+	}
+	// 从文件中读取并存储到HashArray中
+	for (hashIndex = 0, pos_f = 0, pos_c = 0, pos_b = 0; hashIndex < DEDUP_TABLE_SIZE; hashIndex++) {
+		kernel_read(finger_table, hashArray[hashIndex], sizeof(struct Fingeritem), &pos_f);
+		kernel_read(finger_crypt_table, hashcryptArray[hashIndex], sizeof(struct Fingercryptitem), &pos_c);
+		kernel_read(block_table, blkArray[hashIndex], sizeof(struct Blkrefitem), &pos_b);
+	}
+	filp_close(finger_table, NULL);
+	filp_close(finger_crypt_table, NULL);
+	filp_close(block_table, NULL);
+}
+
+void write_finger_blk_table_to_file(void) {
+	struct file *finger_table = NULL;
+	struct file *finger_crypt_table = NULL;
+	struct file *block_table = NULL;
+	loff_t pos_f, pos_b, pos_c;
+	int hashIndex = 0;
+
+	finger_table = filp_open("/fingertable", O_RDWR | O_CREAT, 0);
+	finger_crypt_table = filp_open("/fingercrypttable", O_RDWR | O_CREAT, 0);
+	block_table = filp_open("/blocktable", O_RDWR | O_CREAT, 0);
+	// 把HashArray中所有元素写到文件中
+	for (hashIndex = 0, pos_f = 0, pos_c =0, pos_b=0; hashIndex < DEDUP_TABLE_SIZE; hashIndex++) {
+		if (hashArray[hashIndex] != NULL) {
+			kernel_write(finger_table, hashArray[hashIndex], sizeof(struct Fingeritem), &pos_f);
+		}
+		if (hashcryptArray[hashIndex] != NULL) {
+			kernel_write(finger_crypt_table, hashcryptArray[hashIndex], sizeof(struct Fingercryptitem), &pos_c);
+		}
+		if (blkArray[hashIndex] != NULL) {
+			kernel_write(block_table, blkArray[hashIndex], sizeof(struct Blkrefitem), &pos_b);
+		}
+	}
+	filp_close(finger_table, NULL);
+	filp_close(finger_crypt_table, NULL);
+	filp_close(block_table, NULL);
+}
 
 size_t hashFinger(char *finger)
 {
@@ -105,6 +176,32 @@ struct Blkrefitem *block_search(size_t blk_addr)
 	return NULL;
 }
 
+struct Fingercryptitem *finger_crypt_search(char *finger)
+{
+	//get the hash
+	size_t hashIndex = hashFinger(finger);
+	int loop;
+	//move in array until an empty
+	loop = 0;
+	while (hashcryptArray[hashIndex] != NULL) {
+		int ret =
+			strncmp(hashcryptArray[hashIndex]->fingerprint_crypt, finger, 16);
+		if (!ret)
+			return hashcryptArray[hashIndex];
+
+		//go to next cell
+		++hashIndex;
+		loop++;
+		if (loop > DEDUP_TABLE_SIZE)
+			return NULL;
+
+		//wrap around the table
+		hashIndex %= DEDUP_TABLE_SIZE;
+	}
+
+	return NULL;
+}
+
 int deduptable_insert(char *finger, size_t blk_addr, size_t ref)
 {
 	size_t hashIndex, blkIndex;
@@ -121,7 +218,8 @@ int deduptable_insert(char *finger, size_t blk_addr, size_t ref)
 	hashIndex = hashFinger(finger);
 	loop = 0;
 	//move in array until an empty or deleted cell
-	while (hashArray[hashIndex] != NULL) {
+	// 读文件的时候给所有元素都分配了空间，需要再判断一下blk_addr
+	while (hashArray[hashIndex] != NULL && hashArray[hashIndex]->blk_addr != 0) {
 		//go to next cell
 		++hashIndex;
 
@@ -131,12 +229,13 @@ int deduptable_insert(char *finger, size_t blk_addr, size_t ref)
 		if (loop > DEDUP_TABLE_SIZE)
 			return 1;
 	}
-
+	// 因为读文件的时候给所有元素都分配了空间，所以这里需要先free
+	kfree(hashArray[hashIndex]);
 	hashArray[hashIndex] = finger_item;
 
 	loop = 0;
 	blkIndex = hashBlk(blk_addr);
-	while (blkArray[blkIndex] != NULL) {
+	while (blkArray[blkIndex] != NULL && blkArray[blkIndex]->blk_addr !=0 && blkArray[blkIndex]->ref != 0) {
 		//go to next cell
 		++blkIndex;
 
@@ -146,8 +245,32 @@ int deduptable_insert(char *finger, size_t blk_addr, size_t ref)
 		if (loop > DEDUP_TABLE_SIZE)
 			return 1;
 	}
+	kfree(blkArray[blkIndex]);
 	blkArray[blkIndex] = blk_item;
 
+	return 0;
+}
+
+int crypt_lblknum_insert(char* finger_crypt, u64 lblk_num) {
+	struct Fingercryptitem *finger_crypt_item = (struct Fingercryptitem *)kmalloc(
+		sizeof(struct Fingercryptitem), GFP_KERNEL);
+	int loop = 0;
+	size_t hashIndex = hashFinger(finger_crypt);
+
+	strncpy(finger_crypt_item->fingerprint_crypt, finger_crypt, 16);
+	finger_crypt_item->lblk_num = lblk_num;
+	while (hashcryptArray[hashIndex] != NULL && hashcryptArray[hashIndex]->lblk_num != -1) {
+		//go to next cell
+		++hashIndex;
+
+		//wrap around the table
+		hashIndex %= DEDUP_TABLE_SIZE;
+		loop++;
+		if (loop > DEDUP_TABLE_SIZE)
+			return 1;
+	}
+	kfree(hashcryptArray[hashIndex]);
+	hashcryptArray[hashIndex] = finger_crypt_item;
 	return 0;
 }
 
@@ -3487,7 +3610,7 @@ void __attribute__((optimize("O0"))) hash_page_data(struct page* page, char* dig
 
 static void __attribute__((optimize("O0"))) do_write_page(struct f2fs_summary *sum, struct f2fs_io_info *fio)
 {
-	char digest[16];
+	char digest[16], digest_c[16];
 	struct Fingeritem *finger;
 	struct Blkrefitem *blkitem;
 	int type = __get_segment_type(fio);
@@ -3496,7 +3619,12 @@ static void __attribute__((optimize("O0"))) do_write_page(struct f2fs_summary *s
 	if (keep_order)
 		f2fs_down_read(&fio->sbi->io_order_lock);
 	if (fio->io_type == FS_DATA_IO) {
+		// 从文件中恢复所有hashtable
+		read_finger_blk_table_from_file();
 		hash_page_data(fio->page, digest);
+		// 计算加密page的finger
+		if (fio->encrypted_page)
+			hash_page_data(fio->encrypted_page, digest_c);
 		finger = finger_search(digest);
 		if (finger) {
 			blkitem = block_search(finger->blk_addr);
@@ -3526,8 +3654,15 @@ reallocate:
 		goto reallocate;
 	}
 	f2fs_update_device_state(fio->sbi, fio->ino, fio->new_blkaddr, 1);
-	if (deduptable_insert(digest, fio->new_blkaddr, 1))
-		printk(KERN_ALERT "dedup table is full!");
+	if (fio->io_type == FS_DATA_IO) {
+		// 如果指纹表中找不到finger，添加一条记录到指纹表
+		if (!finger_search(digest))
+			deduptable_insert(digest, fio->new_blkaddr, 1);
+		if (!finger_crypt_search(digest_c) && fio->encrypted_page)
+			crypt_lblknum_insert(digest_c, fio->page->index);
+		// 持久化所有hashtable
+		write_finger_blk_table_to_file();
+	}
 skipwrite:
 	if (keep_order)
 		f2fs_up_read(&fio->sbi->io_order_lock);
