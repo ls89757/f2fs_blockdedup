@@ -35,10 +35,51 @@
 #include "gc.h"
 #include "iostat.h"
 
+enum blk_crypto_mode_num {
+	BLK_ENCRYPTION_MODE_INVALID,
+	BLK_ENCRYPTION_MODE_AES_256_XTS,
+	BLK_ENCRYPTION_MODE_AES_128_CBC_ESSIV,
+	BLK_ENCRYPTION_MODE_ADIANTUM,
+	BLK_ENCRYPTION_MODE_MAX,
+};
+struct fscrypt_mode {
+	const char *friendly_name;
+	const char *cipher_str;
+	int keysize;		/* key size in bytes */
+	int security_strength;	/* security strength in bytes */
+	int ivsize;		/* IV size in bytes */
+	int logged_cryptoapi_impl;
+	int logged_blk_crypto_native;
+	int logged_blk_crypto_fallback;
+	enum blk_crypto_mode_num blk_crypto_mode;
+};
+// 用于加密时保存数据块的块地址
+struct Fingeritem {
+	char fingerprint[16];
+	size_t blk_addr;
+};
+// 用于解密时获得数据块原本的lblk_num
+struct Fingercryptitem {
+	char fingerprint_crypt[16];
+	u64 lblk_num;
+	unsigned long ino;
+};
+struct Blkrefitem {
+	size_t blk_addr;
+	size_t ref;
+};
+// 用于解密时设置数据块的密钥
+struct Keyitem {
+	unsigned long ino;
+	u8 raw_key[FSCRYPT_MAX_KEY_SIZE];
+	struct fscrypt_mode ci_mode;
+};
+
 #define CREATE_TRACE_POINTS
 #include <trace/events/f2fs.h>
 
 static struct kmem_cache *f2fs_inode_cachep;
+// #define FINGER_LIST_FILE "finger_list"
 
 #ifdef CONFIG_F2FS_FAULT_INJECTION
 
@@ -3553,6 +3594,10 @@ static void init_sb_info(struct f2fs_sb_info *sbi)
 {
 	struct f2fs_super_block *raw_super = sbi->raw_super;
 	int i;
+	// 初始化指纹表
+// #ifdef CONFIG_FS_ENCRYPTION
+// 	INIT_LIST_HEAD(&sbi->finger_list_head);
+// #endif
 
 	sbi->log_sectors_per_block =
 		le32_to_cpu(raw_super->log_sectors_per_block);
@@ -4481,6 +4526,45 @@ free_sbi:
 static struct dentry *f2fs_mount(struct file_system_type *fs_type, int flags,
 			const char *dev_name, void *data)
 {
+	extern struct Fingeritem *hashArray[DEDUP_TABLE_SIZE];
+	extern struct Fingercryptitem *hashcryptArray[DEDUP_TABLE_SIZE];
+	extern struct Blkrefitem *blkArray[DEDUP_TABLE_SIZE];
+	extern struct Keyitem *keyArray[DEDUP_TABLE_SIZE];
+	// 从文件中恢复指纹表
+	loff_t pos_f, pos_fc, pos_b, pos_k;
+	int hashIndex = 0;
+	struct file *finger_table = filp_open("/fingertable", O_RDWR | O_CREAT, 0);
+	struct file *finger_crypt_table = filp_open("/fingercrypttable", O_RDWR | O_CREAT, 0);
+	struct file *block_ref_table = filp_open("/blocktable", O_RDWR | O_CREAT, 0);
+	struct file *key_table = filp_open("/keytable", O_RDWR | O_CREAT, 0);
+	for (hashIndex = 0; hashIndex < DEDUP_TABLE_SIZE; hashIndex++) {
+		if (hashArray[hashIndex] == NULL) {
+			hashArray[hashIndex] = (struct Fingeritem *)kmalloc(sizeof(struct Fingeritem), GFP_KERNEL);
+			hashArray[hashIndex]->blk_addr = 0;
+		}
+		if (hashcryptArray[hashIndex] == NULL) {
+			hashcryptArray[hashIndex] = (struct Fingercryptitem *)kmalloc(sizeof(struct Fingercryptitem), GFP_KERNEL);
+			hashcryptArray[hashIndex]->lblk_num = 0;
+		}
+		if (blkArray[hashIndex] == NULL) {
+			blkArray[hashIndex] = (struct Blkrefitem *)kmalloc(sizeof(struct Blkrefitem), GFP_KERNEL);
+			blkArray[hashIndex]->blk_addr = 0;
+		}
+		if (keyArray[hashIndex] == NULL) {
+			keyArray[hashIndex] = (struct Keyitem *)kmalloc(sizeof(struct Keyitem), GFP_KERNEL);
+			keyArray[hashIndex]->ino = 0;
+		}
+	}
+	for (hashIndex = 0, pos_f = 0, pos_fc = 0, pos_b = 0, pos_k = 0; hashIndex < DEDUP_TABLE_SIZE; hashIndex++) {
+		kernel_read(finger_table, hashArray[hashIndex], sizeof(struct Fingeritem), &pos_f);
+		kernel_read(finger_crypt_table, hashcryptArray[hashIndex], sizeof(struct Fingercryptitem), &pos_fc);
+		kernel_read(block_ref_table, blkArray[hashIndex], sizeof(struct Blkrefitem), &pos_b);
+		kernel_read(key_table, keyArray[hashIndex], sizeof(struct Keyitem), &pos_k);
+	}
+	filp_close(finger_table, NULL);
+	filp_close(finger_crypt_table, NULL);
+	filp_close(block_ref_table, NULL);
+	filp_close(key_table, NULL);
 	return mount_bdev(fs_type, flags, dev_name, data, f2fs_fill_super);
 }
 
@@ -4488,6 +4572,28 @@ static void kill_f2fs_super(struct super_block *sb)
 {
 	if (sb->s_root) {
 		struct f2fs_sb_info *sbi = F2FS_SB(sb);
+
+		// 保存指纹表数据
+		extern struct Fingeritem *hashArray[DEDUP_TABLE_SIZE];
+		extern struct Fingercryptitem *hashcryptArray[DEDUP_TABLE_SIZE];
+		extern struct Blkrefitem *blkArray[DEDUP_TABLE_SIZE];
+		extern struct Keyitem *keyArray[DEDUP_TABLE_SIZE];
+		loff_t pos_f, pos_fc, pos_b, pos_k;
+		int hashIndex = 0;
+		struct file *finger_table = filp_open("/fingertable", O_RDWR | O_CREAT, 0);
+		struct file *finger_crypt_table = filp_open("/fingercrypttable", O_RDWR | O_CREAT, 0);
+		struct file *block_ref_table = filp_open("/blocktable", O_RDWR | O_CREAT, 0);
+		struct file *key_table = filp_open("/keytable", O_RDWR | O_CREAT, 0);
+		for (hashIndex = 0, pos_f = 0, pos_fc = 0, pos_b = 0, pos_k = 0; hashIndex < DEDUP_TABLE_SIZE; hashIndex++) {
+			kernel_write(finger_table, hashArray[hashIndex], sizeof(struct Fingeritem), &pos_f);
+			kernel_write(finger_crypt_table, hashcryptArray[hashIndex], sizeof(struct Fingercryptitem), &pos_fc);
+			kernel_write(block_ref_table, blkArray[hashIndex], sizeof(struct Blkrefitem), &pos_b);
+			kernel_write(key_table, keyArray[hashIndex], sizeof(struct Keyitem), &pos_k);
+		}
+		filp_close(finger_table, NULL);
+		filp_close(finger_crypt_table, NULL);
+		filp_close(block_ref_table, NULL);
+		filp_close(key_table, NULL);
 
 		set_sbi_flag(sbi, SBI_IS_CLOSE);
 		f2fs_stop_gc_thread(sbi);
