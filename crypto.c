@@ -28,102 +28,48 @@
 #include <crypto/skcipher.h>
 #include "fscrypt_private.h"
 
-#define DEDUP_TABLE_SIZE 1024*1024
+#define DEDUP_TABLE_SIZE 256
+
 extern struct Fingeritem *hashArray[DEDUP_TABLE_SIZE];
 extern struct Fingercryptitem *hashcryptArray[DEDUP_TABLE_SIZE];
 extern struct Blkrefitem *blkArray[DEDUP_TABLE_SIZE];
+extern struct Keyitem *keyArray[DEDUP_TABLE_SIZE];
 
-struct Cryptitem {
-	char fingerprint_crypt[16];
-	unsigned long ino;
-};
+// 用于加密时保存数据块的块地址
 struct Fingeritem {
 	char fingerprint[16];
 	size_t blk_addr;
 };
+// 用于解密时获得数据块原本的lblk_num
 struct Fingercryptitem {
-	// 用于解密时获得数据块原本的lblk_num
 	char fingerprint_crypt[16];
 	u64 lblk_num;
+	unsigned long ino;
 };
 struct Blkrefitem {
 	size_t blk_addr;
 	size_t ref;
 };
+// 用于解密时设置数据块的密钥
+struct Keyitem {
+	unsigned long ino;
+	u8 raw_key[FSCRYPT_MAX_KEY_SIZE];
+	struct fscrypt_mode ci_mode;
+};
 
-extern struct file *finger_table;
-extern struct file *finger_crypt_table;
-extern struct file *block_table;
-
-
-struct Cryptitem *cryptArray[DEDUP_TABLE_SIZE];
-
-size_t hashCrypt(char *finger){
-	size_t hash = 0;
-	for (size_t i = 0; i < 16; i++)
-		hash += (size_t)finger[i];
-	hash = hash % DEDUP_TABLE_SIZE;
-	return hash;
-}
-
-struct Cryptitem *crypt_search(char *finger)
-{
-	//get the hash
-	size_t hashIndex = hashCrypt(finger);
-	int loop = 0;
-	//move in array until an empty
-	while (cryptArray[hashIndex] != NULL) {
-		int ret =
-			strncmp(cryptArray[hashIndex]->fingerprint_crypt, finger, 16);
-		if (!ret)
-			return cryptArray[hashIndex];
-
-		//go to next cell
-		++hashIndex;
-		loop++;
-		if (loop > DEDUP_TABLE_SIZE)
-			return NULL;
-
-		//wrap around the table
-		hashIndex %= DEDUP_TABLE_SIZE;
-	}
-	return NULL;
-}
-
-int crypttable_insert(char *finger, unsigned long ino) {
-	int loop;
-	int hashIndex;
-	struct Cryptitem *crypt_item = (struct Cryptitem *)kmalloc(sizeof(struct Cryptitem), GFP_KERNEL);
-	strncpy(crypt_item->fingerprint_crypt, finger, 16);
-	crypt_item->ino = ino;
-
-	hashIndex = hashCrypt(finger);
-	loop = 0;
-	while (cryptArray[hashIndex] != NULL && cryptArray[hashIndex]->ino > 0) {
-		//go to next cell
-		++hashIndex;
-
-		//wrap around the table
-		hashIndex %= DEDUP_TABLE_SIZE;
-		loop++;
-		if (loop > DEDUP_TABLE_SIZE)
-			return 1;
-	}
-	kfree(cryptArray[hashIndex]);
-	cryptArray[hashIndex] = crypt_item;
-	return 0;
-}
-
-void read_finger_blk_table_from_file(void);
-void write_finger_blk_table_to_file(void);
 size_t hashFinger(char *finger);
 size_t hashBlk(size_t blk_addr);
+void hash_page_data(struct page* page, char* digest);
+
 struct Fingercryptitem *finger_crypt_search(char *finger);
 struct Fingeritem *finger_search(char *finger);
 struct Blkrefitem *block_search(size_t blk_addr);
-void __attribute__((optimize("O0"))) hash_page_data(struct page* page, char* digest);
-struct inode *f2fs_iget(struct super_block *sb, unsigned long ino);
+struct Keyitem *keyarray_search(size_t ino);
 
+int keyarray_insert(unsigned long ino, u8 *raw_key, struct fscrypt_mode *ci_mode);
+int crypt_lblknum_insert(char* finger_crypt, u64 lblk_num, unsigned long ino);
+
+struct inode *f2fs_iget(struct super_block *sb, unsigned long ino);
 
 static unsigned int num_prealloc_crypto_pages = 32;
 
@@ -177,21 +123,21 @@ EXPORT_SYMBOL(fscrypt_free_bounce_page);
 void fscrypt_generate_iv(union fscrypt_iv *iv, u64 lblk_num,
 			 const struct fscrypt_info *ci)
 {
-	u8 flags = fscrypt_policy_flags(&ci->ci_policy);
+	// u8 flags = fscrypt_policy_flags(&ci->ci_policy);
 
 	memset(iv, 0, ci->ci_mode->ivsize);
 
-	if (flags & FSCRYPT_POLICY_FLAG_IV_INO_LBLK_64) {
-		WARN_ON_ONCE(lblk_num > U32_MAX);
-		WARN_ON_ONCE(ci->ci_inode->i_ino > U32_MAX);
-		lblk_num |= (u64)ci->ci_inode->i_ino << 32;
-	} else if (flags & FSCRYPT_POLICY_FLAG_IV_INO_LBLK_32) {
-		WARN_ON_ONCE(lblk_num > U32_MAX);
-		lblk_num = (u32)(ci->ci_hashed_ino + lblk_num);
-	} else if (flags & FSCRYPT_POLICY_FLAG_DIRECT_KEY) {
-		memcpy(iv->nonce, ci->ci_nonce, FSCRYPT_FILE_NONCE_SIZE);
-	}
-	iv->lblk_num = cpu_to_le64(lblk_num);
+	// if (flags & FSCRYPT_POLICY_FLAG_IV_INO_LBLK_64) {
+	// 	WARN_ON_ONCE(lblk_num > U32_MAX);
+	// 	WARN_ON_ONCE(ci->ci_inode->i_ino > U32_MAX);
+	// 	lblk_num |= (u64)ci->ci_inode->i_ino << 32;
+	// } else if (flags & FSCRYPT_POLICY_FLAG_IV_INO_LBLK_32) {
+	// 	WARN_ON_ONCE(lblk_num > U32_MAX);
+	// 	lblk_num = (u32)(ci->ci_hashed_ino + lblk_num);
+	// } else if (flags & FSCRYPT_POLICY_FLAG_DIRECT_KEY) {
+	// 	memcpy(iv->nonce, ci->ci_nonce, FSCRYPT_FILE_NONCE_SIZE);
+	// }
+	iv->lblk_num = cpu_to_le64(0);
 }
 
 /* Encrypt or decrypt a single filesystem block of file contents */
@@ -207,13 +153,9 @@ int fscrypt_crypt_block(const struct inode *inode, fscrypt_direction_t rw,
 	struct fscrypt_info *ci = inode->i_crypt_info;
 	struct crypto_skcipher *tfm = ci->ci_enc_key.tfm;
 	int res = 0;
-
 	char digest[16];
 	struct Fingercryptitem *finger_crypt_item;
-	struct Cryptitem *crypt_item;
-	// 解密时读取hashtable，获取lblk_num
 	if (rw == FS_DECRYPT) {
-		read_finger_blk_table_from_file();
 		hash_page_data(src_page, digest);
 		finger_crypt_item = finger_crypt_search(digest);
 		if (finger_crypt_item) {
@@ -225,7 +167,7 @@ int fscrypt_crypt_block(const struct inode *inode, fscrypt_direction_t rw,
 		return -EINVAL;
 	if (WARN_ON_ONCE(len % FSCRYPT_CONTENTS_ALIGNMENT != 0))
 		return -EINVAL;
-
+	
 	fscrypt_generate_iv(&iv, lblk_num, ci);
 
 	req = skcipher_request_alloc(tfm, gfp_flags);
@@ -250,29 +192,6 @@ int fscrypt_crypt_block(const struct inode *inode, fscrypt_direction_t rw,
 		fscrypt_err(inode, "%scryption failed for block %llu: %d",
 			    (rw == FS_DECRYPT ? "De" : "En"), lblk_num, res);
 		return res;
-	}
-	// 加密完成之后， destpage存储着密文，计算密文的finger，存储ino
-	if (rw == FS_ENCRYPT) {
-		loff_t pos_ci;
-		int hashIndex = 0;
-		struct file *ci_table = filp_open("/citable", O_RDWR | O_CREAT, 0);
-		for (hashIndex = 0; hashIndex < DEDUP_TABLE_SIZE; hashIndex++) {
-			if (cryptArray[hashIndex] == NULL) {
-				cryptArray[hashIndex] = (struct Cryptitem *)kmalloc(sizeof(struct Cryptitem), GFP_KERNEL);
-				cryptArray[hashIndex]->ino = 0;
-			}
-		}
-		for (hashIndex = 0, pos_ci = 0; hashIndex < DEDUP_TABLE_SIZE; hashIndex++) {
-			kernel_read(ci_table, cryptArray[hashIndex], sizeof(struct Cryptitem), &pos_ci);
-		}
-		hash_page_data(dest_page, digest);
-		if (!crypt_search(digest)) {
-			crypttable_insert(digest, inode->i_ino);
-		}
-		for (hashIndex = 0, pos_ci = 0; hashIndex < DEDUP_TABLE_SIZE; hashIndex++) {
-			kernel_write(ci_table, cryptArray[hashIndex], sizeof(struct Cryptitem), &pos_ci);
-		}
-		filp_close(ci_table, NULL);
 	}
 	return 0;
 }
@@ -388,7 +307,6 @@ EXPORT_SYMBOL(fscrypt_encrypt_block_inplace);
 int fscrypt_decrypt_pagecache_blocks(struct page *page, unsigned int len,
 				     unsigned int offs)
 {
-	// 这里的inode删掉了const关键字
 	struct inode *inode = page->mapping->host;
 	const unsigned int blockbits = inode->i_blkbits;
 	const unsigned int blocksize = 1 << blockbits;
@@ -398,10 +316,8 @@ int fscrypt_decrypt_pagecache_blocks(struct page *page, unsigned int len,
 	int err;
 
 	char digest_c[16];
-	loff_t pos_ci;
-	int hashIndex = 0;
-	struct Cryptitem *crypt_item;
-	struct file *ci_table = filp_open("/citable", O_RDWR | O_CREAT, 0);
+	struct Fingercryptitem *finger_crypt_item;
+	struct Keyitem *key_item;
 
 	if (WARN_ON_ONCE(!PageLocked(page)))
 		return -EINVAL;
@@ -409,22 +325,21 @@ int fscrypt_decrypt_pagecache_blocks(struct page *page, unsigned int len,
 	if (WARN_ON_ONCE(len <= 0 || !IS_ALIGNED(len | offs, blocksize)))
 		return -EINVAL;
 
-	// 从文件中恢复hashtable，读取加密page对应的ino
-	for (hashIndex = 0; hashIndex < DEDUP_TABLE_SIZE; hashIndex++) {
-		if (cryptArray[hashIndex] == NULL) {
-			cryptArray[hashIndex] = (struct Cryptitem *)kmalloc(sizeof(struct Cryptitem), GFP_KERNEL);
-			cryptArray[hashIndex]->ino = 0;
-		}
-	}
-	for (hashIndex = 0, pos_ci = 0; hashIndex < DEDUP_TABLE_SIZE; hashIndex++) {
-		kernel_read(ci_table, cryptArray[hashIndex], sizeof(struct Cryptitem), &pos_ci);
-	}
 	hash_page_data(page, digest_c);
-	crypt_item = crypt_search(digest_c);
-	if (crypt_item) {
+	finger_crypt_item = finger_crypt_search(digest_c);
+	if (finger_crypt_item) {
 		int err;
-		inode = f2fs_iget(inode->i_sb, crypt_item->ino);
+		inode = f2fs_iget(inode->i_sb, finger_crypt_item->ino);
 		err = fscrypt_require_key(inode);
+		if (err) {
+			key_item = keyarray_search(finger_crypt_item->ino);
+			if (key_item) {
+				inode->i_crypt_info = (struct fscrypt_info *)kmalloc(sizeof(struct fscrypt_info), GFP_KERNEL);
+				inode->i_crypt_info->ci_mode = &key_item->ci_mode;
+				inode->i_crypt_info->ci_inode = inode;
+				fscrypt_set_per_file_enc_key(inode->i_crypt_info, key_item->raw_key);
+			}
+		}
 	}
 
 	for (i = offs; i < offs + len; i += blocksize, lblk_num++) {
